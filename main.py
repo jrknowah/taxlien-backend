@@ -1,9 +1,16 @@
 # backend/main.py
+import logging
 import os
+from contextlib import asynccontextmanager
 
 import pandas as pd
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+
+import db
+import sync
+
+log = logging.getLogger("main")
 
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", 10 * 1024 * 1024))
 PREVIEW_ROWS = 5
@@ -15,7 +22,35 @@ ALLOWED_ORIGINS = [
     if o.strip()
 ]
 
-app = FastAPI(title="Tax Lien Analyzer API")
+# Cron expression for the background sync, e.g. "0 6 * * 1" (Mondays 06:00 UTC).
+# Unset disables it. With several uvicorn workers each would run it, so use
+# one worker or run `python sync.py` from cron instead.
+SYNC_CRON = os.getenv("SYNC_CRON")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    scheduler = None
+    if SYNC_CRON:
+        from apscheduler.schedulers.background import BackgroundScheduler
+        from apscheduler.triggers.cron import CronTrigger
+
+        scheduler = BackgroundScheduler(timezone="UTC")
+        scheduler.add_job(_scheduled_sync, CronTrigger.from_crontab(SYNC_CRON, timezone="UTC"))
+        scheduler.start()
+    yield
+    if scheduler:
+        scheduler.shutdown(wait=False)
+
+
+def _scheduled_sync():
+    try:
+        sync.sync_ms_sos()
+    except Exception:
+        log.exception("Scheduled sync failed")
+
+
+app = FastAPI(title="Tax Lien Analyzer API", lifespan=lifespan)
 
 # Allow frontend requests (CORS). Wildcard origins can't be combined with
 # credentials, so origins are listed explicitly.
@@ -31,6 +66,27 @@ app.add_middleware(
 @app.get("/")
 def read_root():
     return {"message": "API is running!"}
+
+
+@app.get("/parcels")
+def list_parcels(
+    county: str | None = None,
+    source: str | None = None,
+    min_value: float | None = None,
+    max_value: float | None = None,
+    include_inactive: bool = False,
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+):
+    conn = db.connect()
+    try:
+        rows, total = db.query_parcels(
+            conn, county=county, source=source, min_value=min_value, max_value=max_value,
+            include_inactive=include_inactive, limit=limit, offset=offset,
+        )
+    finally:
+        conn.close()
+    return {"total": total, "limit": limit, "offset": offset, "results": rows}
 
 
 # Plain `def` so FastAPI runs the blocking pandas parse in a worker thread.
