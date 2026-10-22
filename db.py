@@ -29,6 +29,31 @@ CREATE TABLE IF NOT EXISTS parcels (
     PRIMARY KEY (source, source_id)
 );
 CREATE INDEX IF NOT EXISTS parcels_county ON parcels (county, active);
+
+CREATE TABLE IF NOT EXISTS liens (
+    source            TEXT NOT NULL,
+    source_id         TEXT NOT NULL,
+    county            TEXT NOT NULL,
+    tax_year          INTEGER NOT NULL,
+    parcel_number     TEXT,
+    ppin              TEXT,
+    owner             TEXT,
+    mailing_address   TEXT,
+    property_address  TEXT,
+    legal_description TEXT,
+    acres             REAL,
+    true_value        REAL,
+    face_amount       REAL,
+    sale_date         TEXT,
+    buyer             TEXT,
+    overbid           REAL,
+    status            TEXT NOT NULL,
+    source_url        TEXT,
+    first_seen        TEXT NOT NULL,
+    last_seen         TEXT NOT NULL,
+    PRIMARY KEY (source, source_id)
+);
+CREATE INDEX IF NOT EXISTS liens_county_year ON liens (county, tax_year, status);
 """
 
 COLUMNS = [
@@ -109,6 +134,46 @@ def query_parcels(conn, *, county=None, source=None, min_value=None, max_value=N
     total = conn.execute(f"SELECT COUNT(*) FROM parcels {clause}", args).fetchone()[0]
     rows = conn.execute(
         f"SELECT * FROM parcels {clause} ORDER BY county, market_value DESC LIMIT ? OFFSET ?",
+        [*args, limit, offset],
+    )
+    return [dict(r) for r in rows], total
+
+
+LIEN_COLUMNS = [
+    "source", "source_id", "county", "tax_year", "parcel_number", "ppin", "owner",
+    "mailing_address", "property_address", "legal_description", "acres",
+    "true_value", "face_amount", "sale_date", "buyer", "overbid", "status", "source_url",
+]
+
+
+def upsert_liens(conn, liens: list[dict], seen_at: str) -> None:
+    cols = ", ".join(LIEN_COLUMNS)
+    marks = ", ".join("?" for _ in LIEN_COLUMNS)
+    updates = ", ".join(f"{c} = excluded.{c}" for c in LIEN_COLUMNS if c not in ("source", "source_id"))
+    conn.executemany(
+        f"""INSERT INTO liens ({cols}, first_seen, last_seen) VALUES ({marks}, ?, ?)
+            ON CONFLICT (source, source_id) DO UPDATE SET {updates}, last_seen = excluded.last_seen""",
+        [[lien.get(c) for c in LIEN_COLUMNS] + [seen_at, seen_at] for lien in liens],
+    )
+
+
+def query_liens(conn, *, county=None, tax_year=None, status=None, min_face=None,
+                max_face=None, limit=100, offset=0) -> tuple[list[dict], int]:
+    where, args = [], []
+    for col, op, val in (
+        ("county", "= ? COLLATE NOCASE", county),
+        ("tax_year", "= ?", tax_year),
+        ("status", "= ?", status),
+        ("face_amount", ">= ?", min_face),
+        ("face_amount", "<= ?", max_face),
+    ):
+        if val is not None:
+            where.append(f"{col} {op}")
+            args.append(val)
+    clause = f"WHERE {' AND '.join(where)}" if where else ""
+    total = conn.execute(f"SELECT COUNT(*) FROM liens {clause}", args).fetchone()[0]
+    rows = conn.execute(
+        f"SELECT * FROM liens {clause} ORDER BY county, tax_year DESC, face_amount DESC LIMIT ? OFFSET ?",
         [*args, limit, offset],
     )
     return [dict(r) for r in rows], total

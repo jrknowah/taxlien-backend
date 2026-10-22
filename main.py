@@ -7,6 +7,7 @@ import pandas as pd
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
+import analysis
 import db
 import sync
 
@@ -45,7 +46,7 @@ async def lifespan(app: FastAPI):
 
 def _scheduled_sync():
     try:
-        sync.sync_ms_sos()
+        sync.sync_all()
     except Exception:
         log.exception("Scheduled sync failed")
 
@@ -86,6 +87,29 @@ def list_parcels(
         )
     finally:
         conn.close()
+    return {"total": total, "limit": limit, "offset": offset, "results": rows}
+
+
+@app.get("/liens")
+def list_liens(
+    county: str | None = None,
+    tax_year: int | None = None,
+    status: str | None = Query(None, description="offered, sold, struck_to_state or not_sold"),
+    min_face: float | None = None,
+    max_face: float | None = None,
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+):
+    conn = db.connect()
+    try:
+        rows, total = db.query_liens(
+            conn, county=county, tax_year=tax_year, status=status,
+            min_face=min_face, max_face=max_face, limit=limit, offset=offset,
+        )
+    finally:
+        conn.close()
+    for row in rows:
+        row["metrics"] = analysis.lien_metrics(row["face_amount"], row["overbid"], row["sale_date"])
     return {"total": total, "limit": limit, "offset": offset, "results": rows}
 
 
